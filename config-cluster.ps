@@ -1,0 +1,112 @@
+
+# should be an address space that is within the vnet adddress space
+# but does not overlap with any other subnet address space
+$addressPrefix = "10.2.1.0/24"
+$clusterName = "myAKSCluster"
+$containerRegistryName = ""
+$location = "westus2"
+$resourceGroup = "teamResources"
+$nodeSize = "Standard_DS2_v2"
+$nodeCount = 3
+$subscription = "bc73a756-864c-4429-8918-fe8f8eeee4a7"
+
+Set-AzContext -Subscription $subscription
+az account set --subscription bc73a756-864c-4429-8918-fe8f8eeee4a7
+
+$aksVersion = $(az aks get-versions -l $location --query 'orchestrators[-1].orchestratorVersion' -o tsv)
+
+# Create subnet for AKS cluster
+$SUBNET_ID = $(az network vnet subnet create -n aks-subnet -g $resourceGroup --vnet-name vnet --address-prefix $addressPrefix --query "id" -o tsv)
+
+# Create app registration for Server app
+$serverApplicationId = $(az ad app create --display-name "${clusterName}Server" --identifier-uris "https://${clusterName}Server" --query appId -o tsv)
+az ad app update --id $serverApplicationId --set groupMembershipClaims=All
+az ad sp create --id $serverApplicationId # Creating SP for app
+
+serverApplicationSecret=$(az ad sp credential reset --name $serverApplicationId --credential-description "AKSPassword" --query password -o tsv)
+az ad app permission add `
+    --id $serverApplicationId `
+    --api 00000003-0000-0000-c000-000000000000 `
+    --api-permissions e1fe6dd8-ba31-4d61-89e7-88639da4683d=Scope 06da0dbc-49e2-44d2-8312-53f166ab848a=Scope 7ab1d382-f21e-4acd-a863-ba3e13f7da61=Role 
+    
+az ad app permission grant --id $serverApplicationId --api 00000003-0000-0000-c000-000000000000
+az ad app permission admin-consent --id $serverApplicationId # This cannot be done via cloudshell, workaround is via portal
+
+# Create app registration for Client app
+$clientApplicationId=$(az ad app create `
+    --display-name "${clusterName}Client" `
+    --native-app `
+    --reply-urls "https://${clusterName}Client" `
+    --query appId -o tsv)
+
+az ad sp create --id $clientApplicationId
+
+oAuthPermissionId=$(az ad app show --id $serverApplicationId --query "oauth2Permissions[0].id" -o tsv)
+
+az ad app permission add --id $clientApplicationId --api $serverApplicationId --api-permissions $oAuthPermissionId=Scope
+az ad app permission grant --id $clientApplicationId --api $serverApplicationId
+
+# Add the abiltiy for Live metrics to work via portal (Graph permissions for CLient App)
+az ad app permission add `
+    --id $clientApplicationId `
+    --api 00000003-0000-0000-c000-000000000000 `
+    --api-permissions 64a6cdd6-aab1-4aaf-94b8-3cc8405e90d0=Scope 7427e0e9-2fba-42fe-b0c0-848c9e6a8182=Scope 37f7f235-527c-4136-accd-4a02d197296e=Scope 14dad69e-099b-42c9-810b-d002981feec1=Scope  
+    
+az ad app permission grant --id $clientApplicationId --api 00000003-0000-0000-c000-000000000000
+az ad app permission admin-consent --id $clientApplicationId # This cannot be done via cloudshell, workaround is via portal
+
+# Get tenant ID
+tenantId=$(az account show --query tenantId -o tsv)
+
+# Create SP for AKS cluster and get SP id and password
+$SP = ConvertFrom-Json $(az ad sp create-for-rbac --skip-assignment | out-string)
+$SP_ID = $SP.appId
+$SP_PASSWORD = $SP.password
+
+# Necessary because sometimes there is a delay
+# in the creation of sp and its propogation
+# issue referenced here: https://github.com/Azure/azure-cli/issues/1332
+write-host "Sleeping for 15 to allow for sp propogation"
+Start-Sleep -Seconds 15
+
+# Assign subnet contributor permissions
+az role assignment create --assignee $SP_ID --scope $SUBNET_ID --role Contributor
+
+az aks create `
+    --resource-group $resourceGroup `
+    --name $clusterName `
+    --generate-ssh-keys `
+    --kubernetes-version $aksVersion `
+    --network-plugin azure `
+    --vnet-subnet-id $SUBNET_ID `
+    --docker-bridge-address 172.17.0.1/16 `
+    --service-cidr 172.38.0.0/16 `
+    --dns-service-ip 172.38.0.10 `
+    --aad-server-app-id $serverApplicationId `
+    --aad-server-app-secret $serverApplicationSecret `
+    --aad-client-app-id $clientApplicationId `
+    --aad-tenant-id $tenantId `
+    --service-principal $SP_ID `
+    --client-secret $SP_PASSWORD `
+    --network-policy azure `
+    --attach-acr $containerRegistryName `
+    --node-vm-size $nodeSize `
+    --node-count $nodeCount
+
+az group deployment create --resource-group $resourceGroup --name "${logAnalyticsName}Deploy" --template-file ./LogAnalytics.json --parameters "{
+    `"location`": {
+        `"workspaceName`": `"${logAnalyticsName}`"
+    }
+}"
+
+$logAnalytics = Get-AzResource -Name $logWorkspaceName
+
+az aks enable-addons --addons monitoring -n $clusterName -g $resourceGroup --workspace-resource-id $logAnalytics.ResourceId
+
+az aks get-credentials --name $clusterName --resource-group $resourceGroup --overwrite-existing --admin
+
+# enable the dashboard
+kubectl create clusterrolebinding kubernetes-dashboard -n kube-system --clusterrole=cluster-admin --serviceaccount=kube-system:kubernetes-dashboard
+
+AD_UPN=$(az ad signed-in-user show --query userPrincipalName -o tsv)
+Write-Host "User principal name for current user:" $AD_UPN
